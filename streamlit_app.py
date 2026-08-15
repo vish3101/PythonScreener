@@ -8,13 +8,59 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import requests
 import warnings
 import logging
+import io
 from datetime import datetime
 from io import BytesIO
 
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 warnings.filterwarnings('ignore')
+
+# -------------------------------------------------------------------------
+# NSE की आधिकारिक लिस्ट रोज़ लाइव लाना (Live F&O List from NSE)
+# -------------------------------------------------------------------------
+# NSE हर दिन यह फाइल अपडेट करता है — इसमें वो सभी स्टॉक्स होते हैं जो
+# Futures & Options (F&O) सेगमेंट में ट्रेड होने के लिए Eligible हैं।
+# यही वो आधिकारिक सोर्स है जहाँ से हमारी मूल लिस्ट (नीचे FALLBACK_STOCK_LIST) बनी थी।
+NSE_FO_LIST_URL = "https://nsearchives.nseindia.com/content/fo/NSE_FO_SosScheme.csv"
+
+
+def fetch_live_fo_stock_list():
+    """
+    NSE की साइट से आज की आधिकारिक F&O स्टॉक लिस्ट डाउनलोड करता है।
+    अगर यह किसी वजह से फेल हो (NSE डाउन हो, नेटवर्क इशू हो, फॉर्मेट बदल जाए),
+    तो यह Exception raise करेगा — और बटन दबाने वाला कोड नीचे दी गई
+    FALLBACK_STOCK_LIST पर अपने आप शिफ्ट हो जाएगा, ताकि ऐप कभी टूटे ना।
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        )
+    }
+    response = requests.get(NSE_FO_LIST_URL, headers=headers, timeout=15)
+    response.raise_for_status()
+
+    # पहली लाइन सिर्फ तारीख होती है (जैसे 12082026), असली डेटा दूसरी लाइन से शुरू होता है
+    df = pd.read_csv(io.StringIO(response.text), skiprows=1)
+    df.columns = [c.strip() for c in df.columns]
+
+    # 'Symbol Type' == EQUITY वाली रो ही असली स्टॉक्स हैं
+    # (NIFTY, BANKNIFTY जैसे इंडेक्स को Symbol Type = INDEX से बाहर कर दिया जाता है)
+    equity_symbols = (
+        df[df['Symbol Type'].str.strip() == 'EQUITY']['Symbol']
+        .str.strip()
+        .unique()
+        .tolist()
+    )
+
+    if len(equity_symbols) < 100:
+        # अगर बहुत कम स्टॉक्स मिले तो शायद NSE ने फॉर्मेट बदल दिया — सुरक्षित रहने के लिए फेल मानें
+        raise ValueError(f"सिर्फ {len(equity_symbols)} स्टॉक्स मिले, फॉर्मेट बदला हो सकता है")
+
+    return [f"{symbol}.NS" for symbol in equity_symbols]
 
 # -------------------------------------------------------------------------
 # पेज सेटअप (Page Setup)
@@ -29,9 +75,12 @@ st.write(
 )
 
 # -------------------------------------------------------------------------
-# शेयरों की लिस्ट (Stock List)
+# बैकअप लिस्ट (Fallback Stock List)
+# अगर किसी दिन NSE की साइट से लाइव लिस्ट ना मिल पाए, तो यह वाली इस्तेमाल होगी।
+# यह लिस्ट समय के साथ थोड़ी पुरानी हो सकती है (जैसे कोई नया स्टॉक F&O में जुड़ जाए),
+# लेकिन ऐप कभी पूरी तरह रुकेगा नहीं।
 # -------------------------------------------------------------------------
-my_stocks = [
+FALLBACK_STOCK_LIST = [
     '360ONE.NS', 'ABB.NS', 'APLAPOLLO.NS', 'AUBANK.NS', 'ADANIENSOL.NS',
     'ADANIENT.NS', 'ADANIGREEN.NS', 'ADANIPORTS.NS', 'ADANIPOWER.NS', 'ABCAPITAL.NS',
     'ALKEM.NS', 'AMBER.NS', 'AMBUJACEM.NS', 'ANGELONE.NS', 'APOLLOHOSP.NS',
@@ -152,9 +201,24 @@ def advanced_stock_scanner(ticker_list, progress_bar, status_text):
 # -------------------------------------------------------------------------
 # बटन दबाने पर क्या होगा (What happens when the button is clicked)
 # -------------------------------------------------------------------------
-st.caption(f"आज कुल {len(my_stocks)} शेयर स्कैन होंगे। इसमें लगभग 3-6 मिनट लग सकते हैं।")
+st.caption("बटन दबाते ही सबसे पहले NSE से आज की लाइव F&O स्टॉक लिस्ट लाई जाएगी, फिर स्कैन शुरू होगा।")
 
 if st.button("🔍 आज का स्कैन चलाएं (Run Today's Scan)", type="primary", use_container_width=True):
+
+    # पहला कदम: आज की ताज़ा F&O लिस्ट NSE से लाना (फेल हो तो बैकअप लिस्ट पर जाना)
+    with st.spinner("NSE से आज की F&O स्टॉक लिस्ट लाई जा रही है..."):
+        try:
+            my_stocks = fetch_live_fo_stock_list()
+            st.success(f"✅ NSE से लाइव लिस्ट मिल गई — आज कुल {len(my_stocks)} स्टॉक्स")
+        except Exception as e:
+            my_stocks = FALLBACK_STOCK_LIST
+            st.warning(
+                f"⚠️ NSE से लाइव लिस्ट नहीं मिल पाई, इसलिए सेव्ड बैकअप लिस्ट "
+                f"({len(my_stocks)} स्टॉक्स) इस्तेमाल हो रही है। (वजह: {e})"
+            )
+
+    st.caption(f"कुल {len(my_stocks)} शेयर स्कैन होंगे। इसमें लगभग 3-6 मिनट लग सकते हैं।")
+
     progress_bar = st.progress(0)
     status_text = st.empty()
 
